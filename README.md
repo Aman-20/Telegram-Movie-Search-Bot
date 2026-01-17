@@ -32,7 +32,7 @@ Before you begin, ensure you have the following:
 
 1.  **Clone the repository**
     ```bash
-    git clone [https://github.com/Aman-20/Telegram-Movie-Search-Bot.git](https://github.com/Aman-20/Telegram-Movie-Search-Bot.git)
+    git clone https://github.com/Aman-20/Telegram-Movie-Search-Bot.git
     cd telegram-movie-search-bot
     ```
 
