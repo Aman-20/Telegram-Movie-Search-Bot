@@ -250,16 +250,7 @@ bot.onText(/\/help/, async (msg) => {
   const isAdmin = ADMIN_SET.has(userId);
 
   // 1. Standard Help Message for Everyone
-  let helpText = `📚 <b>Help Menu</b>
-
-👋 <b>User Commands:</b>
-/start - Restart the bot
-/recent - See newly uploaded files
-/trending - See most popular files
-/favorites - Your saved files
-/myaccount - Check your daily limit
-
-🔍 <b>Search:</b>
+  let helpText = `🔍 <b>Search:</b>
 Just type the name of the movie or series you want to find.`;
 
   // 2. Add Admin Commands ONLY if user is an Admin
