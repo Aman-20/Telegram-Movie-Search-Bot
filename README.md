@@ -14,6 +14,7 @@ A robust, high-performance Telegram bot for searching, indexing, and sharing fil
 * **📉 Daily Limits:** Set daily download caps per user to prevent abuse.
 * **🧹 Auto-Delete:** Search results and file links auto-delete to keep chats clean and protect content.
 * **📊 Statistics:** Admin command to view total files and active users.
+* **⚓ Broadcast:** Admin can broadcast message to all users.
 
 ---
 
@@ -62,6 +63,7 @@ To run the bot, you need to configure the following variables in your `.env` fil
 | `REDIS_URL` | ✅ | Your Redis connection string | `redis://default:pass@...` |
 | `RENDER_EXTERNAL_URL`| ✅ | Your app's public URL (for Webhook) | `https://my-bot.onrender.com` |
 | `ADMIN_IDS` | ✅ | Comma-separated User IDs of admins | `12345678, 87654321` |
+| `FORCE_CHANNEL_ID` | ✅ | Your Any Telegram Channel Username | `@Example` |
 | `DAILY_LIMIT` | ❌ | Max downloads per user/day (Default: 100) | `50` |
 | `RESULTS_PER_PAGE` | ❌ | Number of files per page (Default: 10) | `10` |
 
@@ -78,6 +80,7 @@ The bot does **not** rely on complex commands to add files. It uses a "Send & Co
 
 * **Delete a File:** Use `/delete F0001` (replace `F0001` with the file's Custom ID).
 * **View Stats:** Use `/stats` to see database health.
+* **Broadcast:** Use `/broadcast` to broadcast any messages .
 
 ### 👤 For Users
 * **Search:** Just type the name of the movie (e.g., "Iron Man").

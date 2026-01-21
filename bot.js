@@ -15,7 +15,9 @@ const {
   DAILY_LIMIT = '100',
   RESULTS_PER_PAGE = '10',
   PORT = 3000,
-  RENDER_EXTERNAL_URL
+  RENDER_EXTERNAL_URL,
+  // [FEATURE 1] Force Join Config
+  FORCE_CHANNEL_ID // e.g., "@mychannel" or "-100123456789"
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !MONGODB_URI) {
@@ -36,6 +38,14 @@ console.log('✅ MongoDB Connected');
 
 // --- SCHEMAS ---
 const Schema = mongoose.Schema;
+
+// [FEATURE 2] User Schema for Broadcasts
+const UserSchema = new Schema({
+  userId: { type: String, unique: true, index: true },
+  firstName: String,
+  username: String,
+  joinedAt: { type: Date, default: Date.now }
+});
 
 const FileSchema = new Schema({
   customId: { type: String, unique: true, index: true },
@@ -70,6 +80,7 @@ LimitSchema.index({ userId: 1, date: 1 }, { unique: true });
 FavoriteSchema.index({ userId: 1, customId: 1 }, { unique: true });
 PendingSchema.index({ created_at: 1 }, { expireAfterSeconds: 600 });
 
+const User = mongoose.model('User', UserSchema);
 const File = mongoose.model('File', FileSchema);
 const Counter = mongoose.model('Counter', CounterSchema);
 const Limit = mongoose.model('Limit', LimitSchema);
@@ -80,7 +91,7 @@ const Pending = mongoose.model('Pending', PendingSchema);
 
 function autoDeleteMessage(bot, chatId, messageId, delayMs = 60000) {
   setTimeout(() => {
-    bot.deleteMessage(chatId, messageId).catch(() => {});
+    bot.deleteMessage(chatId, messageId).catch(() => { });
   }, delayMs);
 }
 
@@ -109,22 +120,78 @@ async function getUserLimitCount(userId) {
   return doc?.count || 0;
 }
 
-// 🔧 FIX 1: Improved Cleaner for Messy Titles
+// [FEATURE 2] Helper: Save/Update User for Broadcasts
+async function saveUser(msg) {
+  if (!msg.from) return;
+  const userId = String(msg.from.id);
+  try {
+    await User.updateOne(
+      { userId },
+      {
+        $set: {
+          firstName: msg.from.first_name,
+          username: msg.from.username
+        },
+        $setOnInsert: { joinedAt: new Date() }
+      },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.error('Save User Error:', err.message);
+  }
+}
+
+// [FEATURE 1] Helper: Force Subscribe Check
+async function verifyJoin(chatId, userId) {
+  if (!FORCE_CHANNEL_ID) return true; // Feature disabled if env var missing
+  if (ADMIN_SET.has(userId)) return true; // Admins bypass
+
+  // Check Redis Cache first to avoid hitting API limits
+  const cacheKey = `isMember:${userId}`;
+  const cached = await redis.get(cacheKey);
+  if (cached) return cached === 'true';
+
+  try {
+    const member = await bot.getChatMember(FORCE_CHANNEL_ID, userId);
+    const isMember = ['creator', 'administrator', 'member'].includes(member.status);
+
+    // Cache result: 5 mins for true, 1 min for false (in case they just joined)
+    await redis.set(cacheKey, String(isMember), 'EX', isMember ? 300 : 60);
+
+    if (!isMember) {
+      const channelLink = FORCE_CHANNEL_ID.startsWith('@')
+        ? `https://t.me/${FORCE_CHANNEL_ID.replace('@', '')}`
+        : await bot.exportChatInviteLink(FORCE_CHANNEL_ID).catch(() => null);
+
+      await bot.sendMessage(chatId, '⚠️ <b>You must join our channel to use this bot.</b>', {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📢 Join Channel', url: channelLink || 'https://t.me/' }],
+            [{ text: '✅ I Have Joined', callback_data: 'CHECK_JOIN' }]
+          ]
+        }
+      });
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('Force Join Error:', err.message);
+    // If bot isn't admin in channel or ID is wrong, let user pass to avoid breaking bot
+    return true;
+  }
+}
+
 function cleanFileName(text) {
   return text
-    // 1. Remove common video extensions (case insensitive)
     .replace(/\.(mkv|mp4|avi|mov|flv|wmv|webm|m4v)$/i, '')
-    // 2. Remove @usernames
     .replace(/@\w+/g, '')
-    // 3. Replace ALL brackets, dots, underscores, pluses with spaces
-    .replace(/[\[\]\(\)\{\}\.\_\-\+]/g, ' ')
-    // 4. Collapse multiple spaces into one and trim
+    .replace(/[\[\]\(\)\{\}\.\;\:\~\|\,\_\-\+]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
 function generateAttributes(text) {
-  // Split by space and remove single characters/empty strings
   return text.toLowerCase().split(' ').filter(t => t.length > 0);
 }
 
@@ -155,11 +222,14 @@ bot.setMyCommands([
   { command: '/start', description: 'Start bot' },
   { command: '/recent', description: 'New files' },
   { command: '/trending', description: 'Popular files' },
-  { command: '/myaccount', description: 'Check limits' },
   { command: '/favorites', description: 'My saved files' },
-]).catch(() => {});
+  { command: '/myaccount', description: 'Check limits' },
+]).catch(() => { });
 
 bot.onText(/\/start/, async (msg) => {
+  await saveUser(msg); // Track user
+  if (!await verifyJoin(msg.chat.id, String(msg.from.id))) return;
+
   const text = `👋 <b>Welcome, ${msg.from.first_name}!</b>
 
 🔎 <b>How to search:</b>
@@ -176,61 +246,141 @@ Simply type the name of the movie.
 });
 
 bot.onText(/\/help/, async (msg) => {
-  bot.sendMessage(msg.chat.id, 'Just type a movie name to search!');
+  const userId = String(msg.from.id);
+  const isAdmin = ADMIN_SET.has(userId);
+
+  // 1. Standard Help Message for Everyone
+  let helpText = `📚 <b>Help Menu</b>
+
+👋 <b>User Commands:</b>
+/start - Restart the bot
+/recent - See newly uploaded files
+/trending - See most popular files
+/favorites - Your saved files
+/myaccount - Check your daily limit
+
+🔍 <b>Search:</b>
+Just type the name of the movie or series you want to find.`;
+
+  // 2. Add Admin Commands ONLY if user is an Admin
+  if (isAdmin) {
+    helpText += `\n\n👮‍♂️ <b>Admin Commands:</b>
+/stats - View database statistics
+/broadcast [message] - Send text to all users
+/broadcast (reply) - Broadcast the message you reply to
+/delete [ID] - Delete a file by Custom ID
+<i>Upload: Simply send a file/video to the bot to upload it.</i>`;
+  }
+
+  await bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'HTML' });
 });
 
 bot.onText(/\/stats/, async (msg) => {
   if (!ADMIN_SET.has(String(msg.from.id))) return;
-  const total = await File.countDocuments();
+  const totalFiles = await File.countDocuments();
+  const totalUsers = await User.countDocuments();
   const today = new Date().toISOString().slice(0, 10);
   const activeUsers = await Limit.countDocuments({ date: today });
-  
-  await bot.sendMessage(msg.chat.id, `📊 <b>Stats</b>\n\nFiles: ${total}\nActive Users Today: ${activeUsers}`, { parse_mode: 'HTML' });
+
+  await bot.sendMessage(msg.chat.id,
+    `📊 <b>Stats</b>\n\nFiles: ${totalFiles}\nTotal Users: ${totalUsers}\nActive Today: ${activeUsers}`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+// [FEATURE 2] Admin Broadcast Command
+bot.onText(/\/broadcast(?: (.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const fromId = String(msg.from.id);
+
+  if (!ADMIN_SET.has(fromId)) return;
+
+  const text = match[1];
+  const replyMsg = msg.reply_to_message;
+
+  if (!text && !replyMsg) {
+    return bot.sendMessage(chatId, '⚠️ Usage:\n1. <code>/broadcast Message</code>\n2. Reply to a message with <code>/broadcast</code>', { parse_mode: 'HTML' });
+  }
+
+  const users = await User.find({}, { userId: 1 }).lean();
+  let success = 0, blocked = 0;
+
+  const sentMsg = await bot.sendMessage(chatId, `🚀 Broadcasting to ${users.length} users...`);
+
+  // Broadcast Loop
+  for (const user of users) {
+    try {
+      if (replyMsg) {
+        // Copy message (supports images, videos, etc.)
+        await bot.copyMessage(user.userId, chatId, replyMsg.message_id);
+      } else {
+        // Send Text
+        await bot.sendMessage(user.userId, text, { parse_mode: 'HTML' });
+      }
+      success++;
+    } catch (err) {
+      // Error 403 means user blocked bot
+      if (err.response && err.response.statusCode === 403) blocked++;
+    }
+    // Tiny delay to prevent 429 errors
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  bot.editMessageText(`✅ <b>Broadcast Complete</b>\n\nSent: ${success}\nBlocked/Failed: ${blocked}`, {
+    chat_id: chatId,
+    message_id: sentMsg.message_id,
+    parse_mode: 'HTML'
+  });
 });
 
 bot.onText(/\/recent/, async (msg) => {
+  await saveUser(msg);
+  if (!await verifyJoin(msg.chat.id, String(msg.from.id))) return;
+
   const files = await File.find().sort({ uploaded_at: -1 }).limit(10).lean();
   if (!files.length) return bot.sendMessage(msg.chat.id, 'No files yet.');
-  
+
   const keyboard = files.map(f => [{
     text: `📂 ${f.file_size} | ${f.clean_title}`,
     callback_data: `GET:${f.customId}`
   }]);
-  
-  const sent = await bot.sendMessage(msg.chat.id, '🆕 <b>Recent Uploads:</b>', { 
+
+  const sent = await bot.sendMessage(msg.chat.id, '🆕 <b>Recent Uploads:</b>', {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: keyboard } 
+    reply_markup: { inline_keyboard: keyboard }
   });
   autoDeleteMessage(bot, msg.chat.id, sent.message_id);
 });
 
 bot.onText(/\/trending/, async (msg) => {
+  await saveUser(msg);
+  if (!await verifyJoin(msg.chat.id, String(msg.from.id))) return;
+
   const files = await File.find().sort({ downloads: -1 }).limit(10).lean();
   if (!files.length) return bot.sendMessage(msg.chat.id, 'No trending files.');
-  
+
   const keyboard = files.map(f => [{
     text: `🔥 ${f.file_size} | ${f.clean_title}`,
     callback_data: `GET:${f.customId}`
   }]);
-  
-  const sent = await bot.sendMessage(msg.chat.id, '📈 <b>Top Trending:</b>', { 
+
+  const sent = await bot.sendMessage(msg.chat.id, '📈 <b>Top Trending:</b>', {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: keyboard } 
+    reply_markup: { inline_keyboard: keyboard }
   });
   autoDeleteMessage(bot, msg.chat.id, sent.message_id);
 });
 
-// 🔧 FIX 2: Added Missing /favorites Handler
 bot.onText(/\/favorites/, async (msg) => {
+  await saveUser(msg);
+  if (!await verifyJoin(msg.chat.id, String(msg.from.id))) return;
+
   const userId = String(msg.from.id);
-  
-  // 1. Get Favorite IDs
   const favs = await Favorite.find({ userId }).lean();
   if (!favs.length) {
     return bot.sendMessage(msg.chat.id, '⭐ You have no favorite files yet.\nClick "Favorite" on a file to save it.');
   }
 
-  // 2. Fetch File Details
   const fileIds = favs.map(f => f.customId);
   const files = await File.find({ customId: { $in: fileIds } }).lean();
 
@@ -238,7 +388,6 @@ bot.onText(/\/favorites/, async (msg) => {
     return bot.sendMessage(msg.chat.id, '⭐ Your favorites list is empty (files may have been deleted).');
   }
 
-  // 3. Display (First 10)
   const keyboard = files.slice(0, 10).map(f => [{
     text: `⭐ ${f.file_size} | ${f.clean_title}`,
     callback_data: `GET:${f.customId}`
@@ -252,10 +401,11 @@ bot.onText(/\/favorites/, async (msg) => {
 });
 
 bot.onText(/\/myaccount/, async (msg) => {
+  await saveUser(msg);
   const used = await getUserLimitCount(String(msg.from.id));
   const remaining = Math.max(DAILY_LIMIT_NUM - used, 0);
-  
-  await bot.sendMessage(msg.chat.id, 
+
+  await bot.sendMessage(msg.chat.id,
     `👤 <b>Your Account</b>\n\n✅ Used: ${used}\n⏳ Remaining: ${remaining}\n🎯 Limit: ${DAILY_LIMIT_NUM}`,
     { parse_mode: 'HTML' }
   );
@@ -266,10 +416,10 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const fromId = String(msg.from.id);
   const text = msg.text?.trim();
-  
+
   if (text && text.startsWith('/')) return; // Ignore commands
 
-  // 1. Handle Admin File Upload
+  // 1. Handle Admin File Upload (Bypasses Force Join)
   if (ADMIN_SET.has(fromId) && (msg.video || msg.document)) {
     const file = msg.video || msg.document;
     const rawName = msg.caption || file.file_name || "Unknown";
@@ -289,8 +439,8 @@ bot.on('message', async (msg) => {
       file_size: size
     });
 
-    await bot.sendMessage(chatId, 
-      `📝 <b>Review Upload</b>\n\nName: ${clean}\nSize: ${size}\n\nConfirm save?`, 
+    await bot.sendMessage(chatId,
+      `📝 <b>Review Upload</b>\n\nName: ${clean}\nSize: ${size}\n\nConfirm save?`,
       {
         parse_mode: 'HTML',
         reply_markup: {
@@ -305,11 +455,15 @@ bot.on('message', async (msg) => {
 
   // 2. Handle User Search
   if (text) {
+    await saveUser(msg); // Track User
+    // [FEATURE 1] Check Force Join Before Search
+    if (!await verifyJoin(chatId, fromId)) return;
+
     // A. Search by ID
     if (/^F\d{4}$/i.test(text)) {
       const customId = text.toUpperCase();
       const file = await File.findOne({ customId }).lean();
-      
+
       if (!file) {
         const temp = await bot.sendMessage(chatId, '❌ File not found.');
         autoDeleteMessage(bot, chatId, temp.message_id, 3000);
@@ -324,8 +478,8 @@ bot.on('message', async (msg) => {
 
       const caption = `🎬 <b>${file.clean_title}</b>\n📦 ${file.file_size}\n🆔 <code>${file.customId}</code>\n\n⚠️ <i>Auto-deletes in 60s</i>`;
       let sent;
-      const opts = { caption, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❤️ Favorite', callback_data: `FAV:${file.customId}` }]] }};
-      
+      const opts = { caption, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❤️ Favorite', callback_data: `FAV:${file.customId}` }]] } };
+
       if (file.type === 'video') sent = await bot.sendVideo(chatId, file.file_id, opts);
       else sent = await bot.sendDocument(chatId, file.file_id, opts);
 
@@ -356,14 +510,14 @@ bot.on('message', async (msg) => {
     }]);
 
     if (total > RESULTS_PER_PAGE_NUM) {
-      keyboard.push([{ text: `Page 1 of ${Math.ceil(total/RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1` }]);
+      keyboard.push([{ text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1` }]);
     }
 
     const sent = await bot.sendMessage(chatId, `🔍 Found <b>${total}</b> results for "<b>${text}</b>":`, {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: keyboard }
     });
-    
+
     autoDeleteMessage(bot, chatId, sent.message_id);
     autoDeleteMessage(bot, chatId, msg.message_id, 2000);
   }
@@ -374,6 +528,24 @@ bot.on('callback_query', async (q) => {
   const chatId = q.message.chat.id;
   const fromId = String(q.from.id);
   const data = q.data;
+
+  // [FEATURE 1] Handle "I Joined" button specifically
+  if (data === 'CHECK_JOIN') {
+    await redis.del(`isMember:${fromId}`); // Clear cache
+    if (await verifyJoin(chatId, fromId)) {
+      bot.sendMessage(chatId, '✅ <b>Thanks for joining!</b> You can now use the bot.', { parse_mode: 'HTML' });
+      bot.deleteMessage(chatId, q.message.message_id).catch(() => { });
+    } else {
+      bot.answerCallbackQuery(q.id, { text: '❌ You still haven\'t joined the channel!', show_alert: true });
+    }
+    return;
+  }
+
+  // [FEATURE 1] Check membership for all other interactions (downloads, pagination)
+  // Admins bypass this in verifyJoin
+  if (!await verifyJoin(chatId, fromId)) {
+    return bot.answerCallbackQuery(q.id, { text: '⚠️ You must join the channel first!', show_alert: true });
+  }
 
   try {
     if (data.startsWith('CONFIRM:')) {
@@ -398,12 +570,12 @@ bot.on('callback_query', async (q) => {
         clean_title: pending.clean_title,
         attributes: pending.attributes
       });
-      
+
       await Pending.deleteOne({ _id: pendingId });
-      await bot.editMessageText(`✅ <b>Published:</b> ${customId}\n${pending.clean_title}`, { 
-        chat_id: chatId, 
+      await bot.editMessageText(`✅ <b>Published:</b> ${customId}\n${pending.clean_title}`, {
+        chat_id: chatId,
         message_id: q.message.message_id,
-        parse_mode: 'HTML' 
+        parse_mode: 'HTML'
       });
       return;
     }
@@ -417,7 +589,7 @@ bot.on('callback_query', async (q) => {
     if (data.startsWith('GET:')) {
       const customId = data.split(':')[1];
       const file = await File.findOne({ customId }).lean();
-      
+
       if (!file) return bot.answerCallbackQuery(q.id, { text: 'File not found/deleted.' });
 
       const used = await getUserLimitCount(fromId);
@@ -428,7 +600,7 @@ bot.on('callback_query', async (q) => {
       await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
 
       const caption = `🎬 <b>${file.clean_title}</b>\n📦 ${file.file_size}\n🆔 <code>${file.customId}</code>\n\n⚠️ <i>Auto-deletes in 60s</i>`;
-      const opts = { caption, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❤️ Favorite', callback_data: `FAV:${file.customId}` }]] }};
+      const opts = { caption, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❤️ Favorite', callback_data: `FAV:${file.customId}` }]] } };
 
       let sent;
       if (file.type === 'video') sent = await bot.sendVideo(chatId, file.file_id, opts);
@@ -442,12 +614,12 @@ bot.on('callback_query', async (q) => {
       const page = Number(data.split(':')[1]);
       const searchKey = `search:${fromId}`;
       const rawKeywords = await redis.get(searchKey);
-      
+
       if (!rawKeywords) return bot.answerCallbackQuery(q.id, { text: 'Search expired.' });
-      
+
       const keywords = JSON.parse(rawKeywords);
       const query = { attributes: { $all: keywords } };
-      
+
       const total = await File.countDocuments(query);
       const files = await File.find(query)
         .sort({ uploaded_at: -1 })
@@ -464,7 +636,7 @@ bot.on('callback_query', async (q) => {
       if (page > 0) navRow.push({ text: '⬅️ Prev', callback_data: `PAGE:${page - 1}` });
       const maxPage = Math.ceil(total / RESULTS_PER_PAGE_NUM) - 1;
       if (page < maxPage) navRow.push({ text: 'Next ➡️', callback_data: `PAGE:${page + 1}` });
-      
+
       if (navRow.length) keyboard.push(navRow);
 
       await bot.editMessageText(`🔍 Results (Page ${page + 1}/${maxPage + 1})`, {
@@ -478,14 +650,14 @@ bot.on('callback_query', async (q) => {
     if (data.startsWith('FAV:')) {
       const customId = data.split(':')[1];
       const exists = await Favorite.findOne({ userId: fromId, customId }).lean();
-      
+
       if (exists) {
         await Favorite.deleteOne({ userId: fromId, customId });
         await bot.answerCallbackQuery(q.id, { text: 'Removed from favorites' });
       } else {
         const count = await Favorite.countDocuments({ userId: fromId });
         if (count >= 50) return bot.answerCallbackQuery(q.id, { text: 'Max 50 favorites.' });
-        
+
         await Favorite.create({ userId: fromId, customId });
         await bot.answerCallbackQuery(q.id, { text: 'Added to favorites!' });
       }
@@ -494,7 +666,7 @@ bot.on('callback_query', async (q) => {
 
   } catch (err) {
     console.error('Callback Error:', err);
-    bot.answerCallbackQuery(q.id, { text: 'Error occurred' }).catch(() => {});
+    bot.answerCallbackQuery(q.id, { text: 'Error occurred' }).catch(() => { });
   }
 });
 
